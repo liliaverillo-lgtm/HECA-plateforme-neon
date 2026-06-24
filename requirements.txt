@@ -1,0 +1,7 @@
+entsoe-py
+pandas
+pyarrow
+plotly
+streamlit
+huggingface_hub
+psycopg2-binary
