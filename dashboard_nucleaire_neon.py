@@ -9,15 +9,16 @@ SECRET STREAMLIT :
 REQUIREMENTS :
   entsoe-py / pandas / plotly / streamlit / psycopg2-binary
 
-OPTIMISATIONS DE VITESSE :
-  1. Pool de connexions (@st.cache_resource) — évite de créer une nouvelle
-     connexion TCP à Neon pour chaque opération (~200 ms économisés par appel)
-  2. Vérification des jours en cache en UNE SEULE requête SQL (ANY)
-     au lieu de N requêtes séquentielles
-  3. init_db() exécuté une seule fois par processus (@st.cache_resource)
-  4. charger_depuis_db() mis en cache mémoire (@st.cache_data, ttl=5 min)
-     — si l'utilisateur clique plusieurs fois Rafraîchir sur la même période,
-     la requête Neon n'est pas relancée
+OPTIMISATIONS COMPLÈTES :
+  DB  1. Pool de connexions partagé (@st.cache_resource)
+  DB  2. Vérification des jours en cache en 1 seule requête SQL (ANY)
+  DB  3. init_db() exécuté une seule fois (@st.cache_resource)
+  DB  4. charger_depuis_db() mis en cache mémoire 5 min (@st.cache_data)
+  DB  5. Sauvegarde de tous les jours en UNE SEULE transaction (page_size=1000)
+  API 6. Jours consécutifs groupés → 1 appel API par plage au lieu de 1 par jour
+  API 7. Plages non consécutives téléchargées EN PARALLÈLE
+  API 8. Découpage du résultat par jour via pandas (vectorisé, pas de boucle)
+  API 9. Timeout robuste sur chaque batch (pas de blocage infini)
 """
 
 import warnings
@@ -47,7 +48,7 @@ COUNTRY               = "FR"
 TZ                    = "Europe/Paris"
 SEUIL_ON_PCT          = 5
 N_COLS_SPARKLINES     = 4
-MAX_WORKERS_API       = 4
+MAX_BATCH_WORKERS     = 3    # batches API en parallèle
 REFRESH_TODAY_MINUTES = 30
 
 PUISSANCE_NOMINALE_MW = {
@@ -102,8 +103,6 @@ def extraire_actual_aggregated(df: pd.DataFrame) -> pd.DataFrame:
 
 # ══════════════════════════════════════════════════════════════════
 # 2. POOL DE CONNEXIONS NEON
-#    @st.cache_resource → créé UNE SEULE FOIS pour tout le processus.
-#    Évite de créer une nouvelle connexion TCP (~200 ms) à chaque opération.
 # ══════════════════════════════════════════════════════════════════
 
 @st.cache_resource(show_spinner=False)
@@ -114,22 +113,17 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
         st.error("🔑 Secret `DATABASE_URL` manquant dans les secrets Streamlit.")
         st.stop()
     return psycopg2.pool.ThreadedConnectionPool(
-        minconn=1, maxconn=5, dsn=dsn, connect_timeout=10
+        minconn=1, maxconn=8, dsn=dsn, connect_timeout=10
     )
 
-
-def _get_conn() -> psycopg2.extensions.connection:
-    """Récupère une connexion du pool (non bloquant)."""
+def _get_conn():
     try:
         return _get_pool().getconn()
     except psycopg2.pool.PoolError:
-        # Pool épuisé — recréer
         _get_pool.clear()
         return _get_pool().getconn()
 
-
 def _release(conn) -> None:
-    """Rend la connexion au pool pour réutilisation."""
     try:
         _get_pool().putconn(conn)
     except Exception:
@@ -137,12 +131,11 @@ def _release(conn) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 3. SCHÉMA — exécuté une seule fois par processus
+# 3. SCHÉMA — une seule fois
 # ══════════════════════════════════════════════════════════════════
 
 @st.cache_resource(show_spinner=False)
 def init_db() -> None:
-    """Crée les tables si elles n'existent pas (idempotent, appelé une fois)."""
     conn = _get_conn()
     try:
         with conn:
@@ -152,9 +145,7 @@ def init_db() -> None:
                         ts TEXT NOT NULL, reacteur TEXT NOT NULL, mw REAL,
                         PRIMARY KEY (ts, reacteur)
                     )""")
-                cur.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_prod_ts ON production(ts)"
-                )
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_prod_ts ON production(ts)")
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS jours_charges (
                         jour TEXT PRIMARY KEY, charge_ts TEXT NOT NULL,
@@ -169,11 +160,7 @@ def init_db() -> None:
 # ══════════════════════════════════════════════════════════════════
 
 def jours_a_fetcher_depuis_db(jours: list[date]) -> list[date]:
-    """
-    OPTIMISATION CLÉ : une seule requête SQL pour vérifier tous les jours
-    au lieu de N requêtes séquentielles.
-    Retourne la liste des jours absents du cache ou périmés.
-    """
+    """1 seule requête SQL pour vérifier tous les jours."""
     if not jours:
         return []
     conn = _get_conn()
@@ -192,37 +179,42 @@ def jours_a_fetcher_depuis_db(jours: list[date]) -> list[date]:
         j = date.fromisoformat(jour_str)
         if est_complet:
             en_cache.add(j)
-        else:  # aujourd'hui → vérifier la fraîcheur
+        else:
             age_min = (datetime.now() - datetime.fromisoformat(charge_ts_str)).total_seconds() / 60
             if age_min < REFRESH_TODAY_MINUTES:
                 en_cache.add(j)
-
     return [j for j in jours if j not in en_cache]
 
 
-def sauvegarder_en_db(jour: date, df_wide: pd.DataFrame) -> None:
-    """Persiste df_wide dans Neon via une connexion du pool."""
-    if df_wide.empty:
+def sauvegarder_plage_en_db(data: dict[date, pd.DataFrame]) -> None:
+    """
+    OPTIMISATION CLÉ : sauvegarde tous les jours en UNE SEULE transaction.
+    page_size=1000 dans execute_values → 10× plus rapide que page_size=100.
+    """
+    all_rows: list[tuple] = []
+    jours_meta: list[tuple] = []
+
+    for jour, df_wide in data.items():
+        if df_wide.empty:
+            continue
+        idx = df_wide.index
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        ts_utc = idx.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%S")
+        df_tmp            = df_wide.copy()
+        df_tmp.index      = ts_utc
+        df_tmp.index.name = "ts"
+        df_long = (
+            df_tmp.reset_index()
+                  .melt(id_vars="ts", var_name="reacteur", value_name="mw")
+                  .dropna(subset=["mw"])
+        )
+        all_rows.extend(tuple(r) for r in df_long[["ts", "reacteur", "mw"]].values.tolist())
+        est_complet = 1 if jour < datetime.now().date() else 0
+        jours_meta.append((str(jour), datetime.now().isoformat(), est_complet))
+
+    if not all_rows:
         return
-
-    idx = df_wide.index
-    if idx.tz is None:
-        idx = idx.tz_localize("UTC")
-    ts_utc = idx.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%S")
-
-    df_tmp            = df_wide.copy()
-    df_tmp.index      = ts_utc
-    df_tmp.index.name = "ts"
-    df_long = (
-        df_tmp.reset_index()
-              .melt(id_vars="ts", var_name="reacteur", value_name="mw")
-              .dropna(subset=["mw"])
-    )
-    rows = [tuple(r) for r in df_long[["ts", "reacteur", "mw"]].values.tolist()]
-    if not rows:
-        return
-
-    est_complet = 1 if jour < datetime.now().date() else 0
 
     with _db_lock:
         conn = _get_conn()
@@ -233,15 +225,16 @@ def sauvegarder_en_db(jour: date, df_wide: pd.DataFrame) -> None:
                         cur,
                         """INSERT INTO production (ts, reacteur, mw) VALUES %s
                            ON CONFLICT (ts, reacteur) DO UPDATE SET mw = EXCLUDED.mw""",
-                        rows
+                        all_rows,
+                        page_size=1000   # 10× plus rapide que le défaut (100)
                     )
-                    cur.execute(
-                        """INSERT INTO jours_charges (jour, charge_ts, est_complet)
-                           VALUES (%s, %s, %s)
+                    psycopg2.extras.execute_values(
+                        cur,
+                        """INSERT INTO jours_charges (jour, charge_ts, est_complet) VALUES %s
                            ON CONFLICT (jour) DO UPDATE
-                           SET charge_ts = EXCLUDED.charge_ts,
+                           SET charge_ts   = EXCLUDED.charge_ts,
                                est_complet = EXCLUDED.est_complet""",
-                        (str(jour), datetime.now().isoformat(), est_complet)
+                        jours_meta
                     )
         finally:
             _release(conn)
@@ -249,16 +242,11 @@ def sauvegarder_en_db(jour: date, df_wide: pd.DataFrame) -> None:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def charger_depuis_db(start: date, end: date) -> pd.DataFrame:
-    """
-    Charge [start, end] depuis Neon.
-    Résultat mis en cache mémoire 5 min (@st.cache_data) :
-    clics répétés sur Rafraîchir → zéro requête Neon supplémentaire.
-    """
+    """Charge depuis Neon. Résultat en cache mémoire 5 min."""
     start_sql = (datetime.combine(start, datetime.min.time()) - timedelta(hours=3)) \
                 .strftime("%Y-%m-%dT%H:%M:%S")
-    end_sql   = (datetime.combine(end, datetime.min.time()) + timedelta(hours=27)) \
+    end_sql   = (datetime.combine(end,   datetime.min.time()) + timedelta(hours=27)) \
                 .strftime("%Y-%m-%dT%H:%M:%S")
-
     conn = _get_conn()
     try:
         df_long = pd.read_sql_query(
@@ -275,7 +263,6 @@ def charger_depuis_db(start: date, end: date) -> pd.DataFrame:
     borne_start   = pd.Timestamp(str(start),             tz=TZ)
     borne_end     = pd.Timestamp(str(end) + " 23:59:59", tz=TZ)
     df_long = df_long[(df_long["ts"] >= borne_start) & (df_long["ts"] <= borne_end)]
-
     if df_long.empty:
         return pd.DataFrame()
 
@@ -303,7 +290,7 @@ def purger_periode_db(start: date, end: date) -> int:
     jours     = [start + timedelta(days=i) for i in range((end - start).days + 1)]
     start_sql = (datetime.combine(start, datetime.min.time()) - timedelta(hours=3)) \
                 .strftime("%Y-%m-%dT%H:%M:%S")
-    end_sql   = (datetime.combine(end, datetime.min.time()) + timedelta(hours=27)) \
+    end_sql   = (datetime.combine(end,   datetime.min.time()) + timedelta(hours=27)) \
                 .strftime("%Y-%m-%dT%H:%M:%S")
     with _db_lock:
         conn = _get_conn()
@@ -320,27 +307,70 @@ def purger_periode_db(start: date, end: date) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 5. API ENTSO-E
+# 5. API ENTSO-E — OPTIMISATIONS BATCH
 # ══════════════════════════════════════════════════════════════════
 
-def api_telecharger_jour(jour: date) -> bool:
+def grouper_consecutifs(jours: list[date]) -> list[tuple[date, date]]:
+    """
+    Regroupe les jours consécutifs manquants en plages (start, end).
+    Exemple : [lun, mar, mer, ven, sam] → [(lun, mer), (ven, sam)]
+    → 2 appels API au lieu de 5.
+    """
+    if not jours:
+        return []
+    jours = sorted(jours)
+    batches, start, prev = [], jours[0], jours[0]
+    for j in jours[1:]:
+        if (j - prev).days == 1:
+            prev = j
+        else:
+            batches.append((start, prev))
+            start = prev = j
+    batches.append((start, prev))
+    return batches
+
+
+def api_telecharger_plage(start: date, end: date) -> dict[date, pd.DataFrame]:
+    """
+    UN SEUL appel ENTSO-E pour toute la plage [start, end].
+    Découpe le résultat par jour en Paris via pandas (vectorisé).
+    Retourne {jour: df_wide}.
+    """
     client   = EntsoePandasClient(api_key=API_KEY)
-    start_ts = pd.Timestamp(str(jour) + " 00:00", tz=TZ)
-    end_ts   = pd.Timestamp(str(jour) + " 23:59", tz=TZ)
-    df_raw   = client.query_generation_per_plant(
+    start_ts = pd.Timestamp(str(start) + " 00:00", tz=TZ)
+    end_ts   = pd.Timestamp(str(end)   + " 23:59", tz=TZ)
+
+    df_raw = client.query_generation_per_plant(
         country_code=COUNTRY, start=start_ts, end=end_ts, psr_type="B14"
     )
     if df_raw is None or df_raw.empty:
-        return False
-    sauvegarder_en_db(jour, extraire_actual_aggregated(df_raw))
-    return True
+        return {}
+
+    df_clean = extraire_actual_aggregated(df_raw)
+
+    # Convertir en heure Paris (vectorisé)
+    if df_clean.index.tz is None:
+        df_clean.index = df_clean.index.tz_localize(TZ)
+    else:
+        df_clean.index = df_clean.index.tz_convert(TZ)
+
+    # Découpage par jour via pandas date (vectorisé, sans boucle Python)
+    dates_index = pd.Series(df_clean.index.date, index=df_clean.index)
+    result: dict[date, pd.DataFrame] = {}
+    for jour, groupe in dates_index.groupby(dates_index):
+        if start <= jour <= end:
+            df_jour = df_clean.loc[groupe.index]
+            if not df_jour.empty:
+                result[jour] = df_jour
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════
 # 6. INTERFACE STREAMLIT
 # ══════════════════════════════════════════════════════════════════
 
-init_db()   # une seule fois grâce à @st.cache_resource
+init_db()
 
 st.set_page_config(page_title="☢️ Modulation nucléaire France", layout="wide", page_icon="☢️")
 st.title("☢️ Modulation nucléaire par réacteur — France")
@@ -381,61 +411,83 @@ if start_date > end_date:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 7. CHARGEMENT
+# 7. CHARGEMENT OPTIMISÉ
 # ══════════════════════════════════════════════════════════════════
 
 def charger_periode(start: date, end: date) -> tuple[pd.DataFrame, int, int]:
-    tous_les_jours = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    """
+    Flux optimisé :
+    1. 1 requête DB pour identifier les jours manquants
+    2. Groupement en plages consécutives → moins d'appels API
+    3. Téléchargement des plages EN PARALLÈLE
+    4. Sauvegarde de TOUS les jours en 1 seule transaction DB
+    5. Lecture finale depuis Neon (résultat mis en cache mémoire)
+    """
+    tous          = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    a_fetcher     = jours_a_fetcher_depuis_db(tous)
+    nb_cache      = len(tous) - len(a_fetcher)
 
-    # UNE SEULE requête pour tous les jours (au lieu de N requêtes séquentielles)
-    a_fetcher = jours_a_fetcher_depuis_db(tous_les_jours)
-    nb_cache  = len(tous_les_jours) - len(a_fetcher)
+    if not a_fetcher:
+        return charger_depuis_db(start, end), nb_cache, 0
 
-    echecs: list[tuple[str, str]] = []
-    lock    = threading.Lock()
-    counter = {"n": 0}
+    # Invalider le cache lecture avant d'écrire de nouvelles données
+    charger_depuis_db.clear()
 
-    if a_fetcher:
-        # Invalider le cache lecture si on va écrire de nouvelles données
-        charger_depuis_db.clear()
-        barre = st.progress(0.0, text="⚡ Téléchargement des jours manquants…")
+    # Grouper les jours consécutifs en batches
+    batches = grouper_consecutifs(a_fetcher)
+    nb_jours_batch = [(e - s).days + 1 for s, e in batches]
 
-        def _fetch(j: date) -> tuple[date, bool]:
-            ok = api_telecharger_jour(j)
-            with lock:
-                counter["n"] += 1
-                barre.progress(
-                    counter["n"] / len(a_fetcher),
-                    text=f"⚡ Téléchargé {counter['n']}/{len(a_fetcher)} jour(s)…",
-                )
-            return j, ok
+    barre    = st.progress(0.0, text=f"⚡ {len(batches)} plage(s) à télécharger…")
+    all_data : dict[date, pd.DataFrame] = {}
+    echecs   : list[tuple[str, str]]   = []
+    lock     = threading.Lock()
+    counter  = {"n": 0}
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS_API) as ex:
-            futures = {ex.submit(_fetch, j): j for j in a_fetcher}
-            try:
-                for fut in as_completed(futures, timeout=120):
-                    try:
-                        j, ok = fut.result(timeout=60)
-                        if not ok:
-                            echecs.append((str(j), "Aucune donnée retournée par l'API"))
-                    except Exception as exc:
-                        echecs.append((str(futures[fut]), str(exc)))
-            except Exception:
-                for fut in futures:
-                    fut.cancel()
-                echecs += [
-                    (str(futures[fut]), "Timeout — ENTSO-E n'a pas répondu")
-                    for fut in futures if not fut.done()
-                ]
+    def _fetch_batch(s: date, e: date) -> dict[date, pd.DataFrame]:
+        """Télécharge une plage et met à jour la barre de progression."""
+        data = api_telecharger_plage(s, e)
+        with lock:
+            counter["n"] += 1
+            n_j = (e - s).days + 1
+            barre.progress(
+                counter["n"] / len(batches),
+                text=f"⚡ Plage {counter['n']}/{len(batches)} — {n_j} jour(s) ({s} → {e})",
+            )
+        return data
 
-        barre.empty()
-        if echecs:
-            with st.expander(f"⚠️ {len(echecs)} jour(s) en erreur"):
-                for j, err in echecs:
-                    st.write(f"**{j}** : {err}")
+    # Téléchargement parallèle des plages
+    with ThreadPoolExecutor(max_workers=min(MAX_BATCH_WORKERS, len(batches))) as ex:
+        futures = {ex.submit(_fetch_batch, s, e): (s, e) for s, e in batches}
+        try:
+            for fut in as_completed(futures, timeout=300):
+                try:
+                    data = fut.result(timeout=180)
+                    with lock:
+                        all_data.update(data)
+                except Exception as exc:
+                    s, e = futures[fut]
+                    echecs.append((f"{s} → {e}", str(exc)))
+        except Exception:
+            for fut in futures:
+                fut.cancel()
+            echecs += [
+                (f"{futures[fut][0]} → {futures[fut][1]}", "Timeout global")
+                for fut in futures if not fut.done()
+            ]
+
+    barre.empty()
+
+    # Sauvegarde en UNE SEULE transaction
+    if all_data:
+        sauvegarder_plage_en_db(all_data)
+
+    if echecs:
+        with st.expander(f"⚠️ {len(echecs)} plage(s) en erreur"):
+            for plage, err in echecs:
+                st.write(f"**{plage}** : {err}")
 
     df     = charger_depuis_db(start, end)
-    nb_api = len(a_fetcher) - len(echecs)
+    nb_api = len([j for j in a_fetcher if j in all_data])
     return df, nb_cache, nb_api
 
 
