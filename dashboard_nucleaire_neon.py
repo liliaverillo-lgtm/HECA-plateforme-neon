@@ -20,6 +20,7 @@ warnings.filterwarnings("ignore")
 import math
 import sqlite3
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, date
 
@@ -352,20 +353,28 @@ def purger_periode_db(start: date, end: date) -> int:
 # 5. API ENTSO-E — 1 JOUR PAR REQUÊTE, EN PARALLÈLE
 # ══════════════════════════════════════════════════════════════════
 
-def api_telecharger_jour(jour: date) -> tuple[date, pd.DataFrame]:
+def api_telecharger_jour(jour: date) -> tuple[date, pd.DataFrame, str]:
     """
     1 appel ENTSO-E = 1 jour (limite de l'API query_generation_per_plant).
-    Appelé en parallèle via ThreadPoolExecutor pour plusieurs jours.
+    Retourne (jour, df, message_erreur). Si succès, message_erreur est vide.
+    La vraie erreur est imprimée dans les logs Streamlit (print → stderr).
     """
-    client   = EntsoePandasClient(api_key=API_KEY)
-    start_ts = pd.Timestamp(str(jour) + " 00:00", tz=TZ)
-    end_ts   = pd.Timestamp(str(jour) + " 23:59", tz=TZ)
-    df_raw   = client.query_generation_per_plant(
-        country_code=COUNTRY, start=start_ts, end=end_ts, psr_type="B14"
-    )
-    if df_raw is None or df_raw.empty:
-        return jour, pd.DataFrame()
-    return jour, extraire_actual_aggregated(df_raw)
+    try:
+        client   = EntsoePandasClient(api_key=API_KEY, retry_count=2, retry_delay=3)
+        start_ts = pd.Timestamp(str(jour) + " 00:00", tz=TZ)
+        end_ts   = pd.Timestamp(str(jour) + " 23:59", tz=TZ)
+        df_raw   = client.query_generation_per_plant(
+            country_code=COUNTRY, start=start_ts, end=end_ts, psr_type="B14"
+        )
+        if df_raw is None or df_raw.empty:
+            return jour, pd.DataFrame(), "Aucune donnée publiée par ENTSO-E pour ce jour"
+        return jour, extraire_actual_aggregated(df_raw), ""
+    except Exception as exc:
+        # Imprimer le traceback complet dans les logs Streamlit Cloud
+        msg = f"{type(exc).__name__}: {exc}"
+        print(f"[ENTSO-E ERREUR] {jour} → {msg}", flush=True)
+        traceback.print_exc()
+        return jour, pd.DataFrame(), msg
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -432,31 +441,32 @@ def charger_periode(start: date, end: date) -> tuple[pd.DataFrame, int, int]:
     barre   = st.progress(0.0, text=f"⚡ {len(a_fetcher)} jour(s) à télécharger…")
 
     def _fetch(j: date):
-        jour, df = api_telecharger_jour(j)
+        jour, df, err = api_telecharger_jour(j)
         with lock:
             counter["n"] += 1
             barre.progress(
                 counter["n"] / len(a_fetcher),
                 text=f"⚡ Téléchargé {counter['n']}/{len(a_fetcher)} jour(s)…"
             )
-        return jour, df
+        return jour, df, err
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS_API) as ex:
         futures = {ex.submit(_fetch, j): j for j in a_fetcher}
         try:
             for fut in as_completed(futures, timeout=300):
                 try:
-                    jour, df = fut.result(timeout=90)
+                    jour, df, err = fut.result(timeout=90)
                     if not df.empty:
                         with lock:
                             all_data[jour] = df
                     else:
-                        echecs.append((str(futures[fut]), "Aucune donnée retournée"))
+                        echecs.append((str(futures[fut]), err or "Aucune donnée retournée"))
                 except Exception as exc:
-                    echecs.append((str(futures[fut]), str(exc) or "Erreur inconnue"))
-        except Exception:
+                    echecs.append((str(futures[fut]), f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__))
+        except Exception as exc_global:
             for fut in futures:
                 fut.cancel()
+            st.error(f"Erreur globale de téléchargement : {type(exc_global).__name__}: {exc_global}")
 
     barre.empty()
 
